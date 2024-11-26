@@ -1,4 +1,5 @@
 //! SD/MMC Host Controller peripheral.
+use log::trace;
 use volatile_register::{RO, RW};
 
 use crate::ccu::{self, Clocks, SmhcClockSource};
@@ -1151,6 +1152,154 @@ impl<SMHC: AsRef<RegisterBlock>, PADS> Smhc<SMHC, PADS> {
             ccu.smhc_bgr.modify(|val| val.gate_mask::<SMHC_IDX>());
         }
         (self.smhc, self.pads)
+    }
+}
+
+#[inline]
+fn command_config(command: u8) -> ((bool, TransferDirection), (bool, bool), bool) {
+    use embedded_sdmmc::sdcard::proto::*;
+    const CMD2: u8 = 2;
+    #[allow(unused)]
+    enum TransferMode {
+        NoTransfer,
+        Read,
+        Write,
+    }
+    enum ResponseMode {
+        NoResponse,
+        Short,
+        Long,
+    }
+    use {ResponseMode::*, TransferMode::*};
+    let (transfer_mode, response_mode, has_crc_check) = match command {
+        CMD0 => (NoTransfer, Short, false),
+        CMD2 => (NoTransfer, Long, true),
+        CMD8 => (NoTransfer, Short, true),
+        CMD55 => (NoTransfer, Short, true),
+        ACMD41 => (NoTransfer, Short, false),
+        // TODO: other commands
+        _ => (NoTransfer, NoResponse, false),
+    };
+    let transfer = match transfer_mode {
+        NoTransfer => (false, TransferDirection::Read),
+        Read => (true, TransferDirection::Read),
+        Write => (true, TransferDirection::Write),
+    };
+    let response = match response_mode {
+        NoResponse => (false, false),
+        Short => (true, false),
+        Long => (true, true),
+    };
+    (transfer, response, has_crc_check)
+}
+
+impl<SMHC: AsRef<RegisterBlock>, PADS> embedded_sdmmc::Transport for Smhc<SMHC, PADS> {
+    type Error = ();
+
+    #[inline]
+    fn write_card_command(&mut self, command: u8, arg: u32) -> Result<(), Self::Error> {
+        log::trace!("write_card_command command {}, arg {}!", command, arg);
+        // log::trace!("command register {:x?}", self.smhc.as_ref().command.read());
+        let (
+            (data_transfer, transfer_direction),
+            (has_response, long_response),
+            has_crc_check
+        ) = command_config(command);
+        let mut command = Command::default()
+            .set_command_start()
+            .set_command_index(command)
+            .set_transfer_direction(transfer_direction)
+            .enable_wait_for_complete()
+            .enable_auto_stop();
+        log::trace!("1");
+        if data_transfer {
+            command = command.enable_data_transfer();
+        }
+        if has_crc_check {
+            command = command.enable_check_response_crc();
+        }
+        if has_response {
+            command = command.enable_response_receive();
+        }
+        if long_response {
+            command = command.enable_long_response();
+        }
+        log::trace!("2");
+        let smhc = self.smhc.as_ref();
+        unsafe {
+            smhc.argument.modify(|v| v.set_argument(arg));
+            smhc.command.write(command);
+        }
+        log::trace!("3");
+        // log::trace!("error: {:?}", smhc.interrupt_state_raw.read());
+        log::trace!("4");
+        for _ in 0..=100_000_000 {
+            unsafe { core::arch::asm!("nop") };
+        }
+        log::trace!("5");
+        // log::trace!("error: {:?}", smhc.interrupt_state_raw.read());
+        Ok(())
+    }
+
+    #[inline]
+    fn read_card_response_u8(&mut self) -> Result<u8, Self::Error> {
+        log::trace!("read_card_response_u8, self.smhc.as_ref().responses[0].read() = 0x{:08x}", self.smhc.as_ref().responses[0].read());
+        Ok((self.smhc.as_ref().responses[0].read() & 0xff) as u8)
+    }
+
+    #[inline]
+    fn read_card_response_u32(&mut self) -> Result<u32, Self::Error> {
+        log::trace!("read_card_response_u32, self.smhc.as_ref().responses[0].read() = 0x{:08x}", self.smhc.as_ref().responses[0].read());
+        Ok(self.smhc.as_ref().responses[0].read())
+    }
+
+    #[inline]
+    fn read_card_response_u128(&mut self) -> Result<u128, Self::Error> {
+        let smhc = self.smhc.as_ref();
+        let mut ans = 0;
+        for i in 0..4 {
+            ans |= (smhc.responses[i].read() as u128) << (32 * i);
+        }
+        log::trace!("read_card_response_u32, ans = 0x{:032x}", ans);
+        Ok(ans)
+    }
+
+    #[inline]
+    fn write_data(&mut self, buf: &[u8]) -> Result<(), Self::Error> {
+        log::trace!("write_data");
+        let smhc = self.smhc.as_ref();
+        for bytes in buf.chunks(size_of::<u32>()) {
+            let word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            unsafe { smhc.fifo.write(word) };
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn read_data(&mut self, buf: &mut [u8]) -> Result<(), Self::Error> {
+        log::trace!("read_data");
+        let smhc = self.smhc.as_ref();
+        for bytes in buf.chunks_mut(size_of::<u32>()) {
+            let word = smhc.fifo.read();
+            bytes.clone_from_slice(&u32::to_be_bytes(word));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn flush_card(&mut self) -> Result<(), Self::Error> {
+        log::trace!("flush_card");
+        // TODO: flush card. We do nothing here first.
+        Ok(())
+    }
+
+    #[inline]
+    fn is_busy(&mut self) -> Result<bool, Self::Error> {
+        log::trace!("is_busy, command: {:x?}, is_command_start_cleared: {}, is_busy: {}",
+        self.smhc.as_ref().command.read(),
+        self.smhc.as_ref().command.read().is_command_start_cleared(),
+        !self.smhc.as_ref().command.read().is_command_start_cleared());
+        Ok(!self.smhc.as_ref().command.read().is_command_start_cleared())
     }
 }
 

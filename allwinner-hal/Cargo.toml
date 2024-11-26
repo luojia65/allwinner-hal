@@ -23,6 +23,12 @@ embedded-io = "0.6.1"
 embedded-time = "0.12.1"
 uart16550 = "0.0.1"
 plic = "0.0.2"
+log = "*"
+
+[dependencies.embedded-sdmmc]
+# git = "https://github.com/luojia65/embedded-sdmmc-rs"
+# branch = "decouple-spi"
+path = "../../embedded-sdmmc-rs"
 
 [dev-dependencies]
 memoffset = "0.8"
